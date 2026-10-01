@@ -202,6 +202,37 @@ CREATE TRIGGER payments_frozen_trg
     BEFORE UPDATE OR DELETE ON payments
     FOR EACH ROW EXECUTE FUNCTION payments_frozen();
 
+-- 付款退回（银行退票）：财务凭原付款流水号 + 退回流水号登记，金额为正整数。
+-- refund_ref 全局唯一：同一退回流水号同内容重试幂等返回原记录，异内容冲突拒绝；
+-- 同一原付款的累计退回不得超过原付款金额（应用层在权利人行锁下校验，
+-- 并发多个退回合计绝不超额）；原付款与单据保持不可变，不随退回改写。
+CREATE TABLE IF NOT EXISTS payment_refunds (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payment_id   bigint NOT NULL REFERENCES payments(id),
+    holder_code  text NOT NULL REFERENCES rightsholders(code),
+    refund_ref   text NOT NULL UNIQUE,
+    amount       bigint NOT NULL CHECK (amount > 0),
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+-- 按原付款汇总累计退回（超额校验）、按权利人列退回流水（对账单）的主查询索引
+CREATE INDEX IF NOT EXISTS payment_refunds_payment_idx ON payment_refunds(payment_id, id);
+CREATE INDEX IF NOT EXISTS payment_refunds_holder_idx ON payment_refunds(holder_code, id);
+
+-- 退回记录一经登记不可修改/删除（与付款同等冻结）
+CREATE OR REPLACE FUNCTION payment_refunds_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'registered payment refunds are frozen and must not be '
+                  || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_refunds_frozen_trg ON payment_refunds;
+CREATE TRIGGER payment_refunds_frozen_trg
+    BEFORE UPDATE OR DELETE ON payment_refunds
+    FOR EACH ROW EXECUTE FUNCTION payment_refunds_frozen();
+
 -- 单据的可追溯性标记：traceable（本轮起出具、带逐笔证据）；
 -- legacy_untraceable（升级前已存在、只有汇总明细行、无法逐笔追溯的存量单据）
 ALTER TABLE statement_batches
@@ -285,6 +316,11 @@ CREATE TABLE IF NOT EXISTS receipt_verification_lines (
     created_at          timestamptz NOT NULL DEFAULT now(),
     UNIQUE (verification_id, receipt_id)
 );
+-- 核验行另冻结"对应付款当时的累计退回额"（银行退票）；匹配/不符判定仍只看
+-- 原付款字段，退回额仅作冻结证据：复核时结论或退回额变化才产生新版本。
+-- 付款未登记 / 重复回单该列为空（不参与核验）。
+ALTER TABLE receipt_verification_lines
+    ADD COLUMN IF NOT EXISTS payment_refunded_total bigint;
 
 -- 历史不可变：回单批次、原始回单、核验版本与逐行结论一经写入
 -- 即禁止修改/删除（核验只新增版本，绝不改写付款、余额或单据）。

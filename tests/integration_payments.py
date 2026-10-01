@@ -282,7 +282,7 @@ try:
                 barrier.wait()
                 c.post("/plays/import", json={
                     "import_id": f"PR-{i}", "work_code": "W",
-                    "occurred_at": f"2026-02-{(i % 20) + 1}T20:00:00+08:00",
+                    "occurred_at": f"2026-02-{(i % 20) + 1:02d}T20:00:00+08:00",
                     "amount": 100})
                 c.post("/statements/issue", json=period)
 

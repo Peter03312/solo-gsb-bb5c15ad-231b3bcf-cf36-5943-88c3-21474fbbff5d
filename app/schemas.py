@@ -274,6 +274,41 @@ class PaymentOut(BaseModel):
     balance_after: int
 
 
+# ---- 银行退票（付款退回）----
+
+class RefundIn(BaseModel):
+    # 原付款流水号（已登记付款）
+    external_ref: str = Field(min_length=1, max_length=200)
+    # 退回流水号（调用方提供，全局唯一）
+    refund_ref: str = Field(min_length=1, max_length=200)
+    # 正整数分额（最小货币单位）
+    amount: int = Field(strict=True, ge=1)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def reject_bool_amount(cls, v):
+        # JSON 的 true/false 虽是 int 子类，但不是合法金额
+        if isinstance(v, bool):
+            raise ValueError("amount must be an integer, not boolean")
+        return v
+
+
+class RefundOut(BaseModel):
+    refund_id: int
+    payment_id: int
+    holder_code: str
+    # 原付款流水号
+    external_ref: str
+    # 退回流水号
+    refund_ref: str
+    amount: int
+    registered_at: datetime
+    # created=新登记；duplicate=同退回流水号同内容重试，返回原记录
+    status: str
+    # 登记后余额（含本次退回；同退回流水号重试时为当前余额）
+    balance_after: int
+
+
 # 单据增减条目（全部期间已出具单据的明细行，追补差额保留正负号）
 class LedgerStatementItem(BaseModel):
     batch_id: int
@@ -292,6 +327,18 @@ class LedgerPaymentItem(BaseModel):
     registered_at: datetime
 
 
+# 退回流水条目（银行退票，加回余额）
+class LedgerRefundItem(BaseModel):
+    refund_id: int
+    payment_id: int
+    # 原付款流水号
+    external_ref: str
+    # 退回流水号
+    refund_ref: str
+    amount: int
+    registered_at: datetime
+
+
 class HolderLedger(BaseModel):
     holder_code: str
     name: str | None
@@ -299,10 +346,27 @@ class HolderLedger(BaseModel):
     billed_total: int
     # 已登记付款累计
     paid_total: int
-    # 当前余额 = billed_total - paid_total（可为负：跨期负额追补后留待后续抵扣）
+    # 已登记退回（银行退票）累计
+    refunded_total: int
+    # 当前余额 = billed_total - paid_total + refunded_total
+    # （可为负：跨期负额追补后留待后续抵扣）
     balance: int
     statements: list[LedgerStatementItem]
     payments: list[LedgerPaymentItem]
+    refunds: list[LedgerRefundItem]
+
+
+class PaymentRefundsOut(BaseModel):
+    payment_id: int
+    external_ref: str
+    holder_code: str
+    # 原付款金额
+    payment_amount: int
+    # 该付款已登记退回累计
+    refunded_total: int
+    # 尚可退回额 = payment_amount - refunded_total
+    remaining_refundable: int
+    refunds: list[LedgerRefundItem]
 
 
 # ---- 银行回单批次导入与付款核验 ----
@@ -353,6 +417,8 @@ class ReceiptDifferenceOut(BaseModel):
     # 核验时冻结的已登记付款快照；付款未登记/重复回单为 None
     payment_holder_code: str | None
     payment_amount: int | None
+    # 核验时冻结的对应付款累计退回额（银行退票）；未登记/重复回单为 None
+    payment_refunded_total: int | None
 
 
 class ReceiptVerificationOut(BaseModel):

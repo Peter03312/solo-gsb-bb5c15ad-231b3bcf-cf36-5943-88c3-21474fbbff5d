@@ -208,4 +208,28 @@ $C -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' -d '{
   ]
 }' | python3 -m json.tool
 
+say "31) 银行退票：凭原付款流水号 + 退回流水号登记退回 5 分（余额 = 单据累计 - 付款累计 + 退回累计）"
+$C -X POST "$BASE/payments/refunds" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260301-0001","refund_ref":"RET-20260315-0001","amount":5}' | python3 -m json.tool
+
+say "32) 同退回流水号同内容重试 => 幂等 duplicate(HTTP 200)；异内容 => 409 refund_ref_conflict"
+$C -i -X POST "$BASE/payments/refunds" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260301-0001","refund_ref":"RET-20260315-0001","amount":5}' | head -1
+$C -i -X POST "$BASE/payments/refunds" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260301-0001","refund_ref":"RET-20260315-0001","amount":6}' | head -1
+
+say "33) 累计退回超原付款金额(已退 5，再退 15 => 20 > 19) => 409 refund_exceeds_payment，不留记录；原付款不存在 => 404"
+$C -i -X POST "$BASE/payments/refunds" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260301-0001","refund_ref":"RET-20260315-0002","amount":15}' | head -1
+$C -i -X POST "$BASE/payments/refunds" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-NOPE","refund_ref":"RET-X","amount":1}' | head -1
+
+say "34) 按原付款流水号查询逐笔退回：累计退回 5、尚可退回 14；对账单另列退回总额"
+$C "$BASE/payments/BANK-20260301-0001/refunds" | python3 -m json.tool
+$C "$BASE/rightsholders/RS-A/ledger" | python3 -m json.tool
+
+say "35) 退票后复核回单批次：核验结论不变（仍按原付款字段判定），但冻结的累计退回额变化 => 仍生成新核验版本"
+$C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
+$C "$BASE/receipts/RC-20260301-01/versions" | python3 -m json.tool
+
 say "完成"
