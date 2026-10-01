@@ -9,13 +9,17 @@
   两项均不符同时列出；导入时冻结逐行结论（第 1 版）。
 - 付款迟到后可复核：结论变化才生成新版本，结论不变不新增版本；
   旧版本与原始回单始终可查。
+- 退票联动：有效回单仍按原付款字段（流水号、权利人、金额）判定匹配与不符，
+  退回不改变结论；导入与复核时另冻结该付款当时的累计退回额，
+  仅当"原核验结论或冻结退回额变化"才产生新核验版本，旧版结论不改写；
+  重复回单仍不参与核验。
 - 并发协议：
   * 导入经"全局导入咨询锁"串行化 —— "首次成功导入"的判定确定、无竞态，
     批次号/回单编号的内容检查与插入原子完成；
   * 复核经"每批次咨询锁"串行化 —— 同一批次并发复核不会产生重复版本；
-  * 核验读取付款使用单条 SQL（单语句快照）：付款与复核并发时，
-    一版内全部逐行结论来自同一已提交状态；
-  * 核验只写回单/结论表，绝不改写付款、余额或单据。
+  * 核验读取付款与累计退回使用单条 SQL（单语句快照）：付款/退回与复核并发时，
+    一版内全部逐行结论（含冻结退回额）来自同一已提交状态；
+  * 核验只写回单/结论表，绝不改写付款、退回、余额或单据。
 """
 import hashlib
 import json
@@ -59,15 +63,21 @@ def _content_hash(lines) -> str:
 def _compute_lines(conn, batch_id: int) -> list[dict]:
     """按当前已登记付款计算某批次全部回单的逐行结论。
 
-    单条 SQL 左连接付款表：即使付款登记与本查询并发，
-    全部行结论也来自同一已提交快照（语句级一致性）。
+    单条 SQL 左连接付款表，并以关联子查询一并取出该付款当前累计退回额：
+    即使付款/退回登记与本查询并发，全部行结论（含冻结退回额）也来自同一
+    已提交快照（语句级一致性，单事务内不发生重算）。
     """
     rows = conn.execute(
         """
         SELECT r.id AS receipt_id, r.receipt_no, r.external_ref,
                r.holder_code, r.amount, r.is_duplicate,
                p.holder_code AS payment_holder_code,
-               p.amount AS payment_amount
+               p.amount AS payment_amount,
+               COALESCE((
+                   SELECT SUM(rf.amount)
+                   FROM payment_refunds rf
+                   WHERE rf.payment_id = p.id
+               ), 0) AS payment_refunded_total
         FROM receipts r
         LEFT JOIN payments p ON p.external_ref = r.external_ref
         WHERE r.batch_id = %s
@@ -82,10 +92,15 @@ def _compute_lines(conn, batch_id: int) -> list[dict]:
         payment_amount = (
             int(r["payment_amount"]) if r["payment_amount"] is not None else None
         )
+        refunded_total = (
+            int(r["payment_refunded_total"])
+            if payment_holder is not None
+            else None
+        )
         if r["is_duplicate"]:
             # 重复回单不参与核验（流水号首次导入的回单才有结论）
             status, holder_mm, amount_mm = DUPLICATE, False, False
-            payment_holder, payment_amount = None, None
+            payment_holder, payment_amount, refunded_total = None, None, None
         elif payment_holder is None:
             status, holder_mm, amount_mm = NOT_REGISTERED, False, False
         else:
@@ -100,19 +115,21 @@ def _compute_lines(conn, batch_id: int) -> list[dict]:
                 "amount_mismatch": amount_mm,
                 "payment_holder_code": payment_holder,
                 "payment_amount": payment_amount,
+                "payment_refunded_total": refunded_total,
             }
         )
     return lines
 
 
 def _conclusion_tuple(line: dict) -> tuple:
-    """一行的"结论"：状态 + 不符项 + 付款快照，用于版本间比较。"""
+    """一行的"结论"：状态 + 不符项 + 付款快照（含累计退回额），用于版本间比较。"""
     return (
         line["status"],
         bool(line["holder_mismatch"]),
         bool(line["amount_mismatch"]),
         line["payment_holder_code"],
         line["payment_amount"],
+        line["payment_refunded_total"],
     )
 
 
@@ -131,14 +148,15 @@ def _insert_version(conn, batch_id: int, version: int, lines: list[dict]):
             INSERT INTO receipt_verification_lines
                 (verification_id, receipt_id, status,
                  holder_mismatch, amount_mismatch,
-                 payment_holder_code, payment_amount)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                 payment_holder_code, payment_amount, payment_refunded_total)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             [
                 (
                     v["id"], l["receipt_id"], l["status"],
                     l["holder_mismatch"], l["amount_mismatch"],
                     l["payment_holder_code"], l["payment_amount"],
+                    l["payment_refunded_total"] or 0,
                 )
                 for l in lines
             ],
@@ -160,6 +178,7 @@ def _version_payload(conn, batch_id: int, batch_no: str, version: int) -> dict:
         """
         SELECT l.status, l.holder_mismatch, l.amount_mismatch,
                l.payment_holder_code, l.payment_amount,
+               l.payment_refunded_total,
                r.receipt_no, r.external_ref, r.holder_code, r.amount
         FROM receipt_verification_lines l
         JOIN receipts r ON r.id = l.receipt_id
@@ -170,9 +189,31 @@ def _version_payload(conn, batch_id: int, batch_no: str, version: int) -> dict:
     ).fetchall()
 
     counts = {s: 0 for s in _STATUSES}
+    all_lines = []
     differences = []
     for r in rows:
         counts[r["status"]] += 1
+        refunded_total = (
+            int(r["payment_refunded_total"])
+            if r["payment_holder_code"] is not None
+            else None
+        )
+        item = {
+            "receipt_no": r["receipt_no"],
+            "external_ref": r["external_ref"],
+            "status": r["status"],
+            "differences": [],
+            "receipt_holder_code": r["holder_code"],
+            "receipt_amount": int(r["amount"]),
+            "payment_holder_code": r["payment_holder_code"],
+            "payment_amount": (
+                int(r["payment_amount"])
+                if r["payment_amount"] is not None
+                else None
+            ),
+            "payment_refunded_total": refunded_total,
+        }
+        all_lines.append(item)
         if r["status"] == MATCHED:
             continue
         diffs = []
@@ -180,22 +221,8 @@ def _version_payload(conn, batch_id: int, batch_no: str, version: int) -> dict:
             diffs.append("holder_mismatch")
         if r["amount_mismatch"]:
             diffs.append("amount_mismatch")
-        differences.append(
-            {
-                "receipt_no": r["receipt_no"],
-                "external_ref": r["external_ref"],
-                "status": r["status"],
-                "differences": diffs,
-                "receipt_holder_code": r["holder_code"],
-                "receipt_amount": int(r["amount"]),
-                "payment_holder_code": r["payment_holder_code"],
-                "payment_amount": (
-                    int(r["payment_amount"])
-                    if r["payment_amount"] is not None
-                    else None
-                ),
-            }
-        )
+        item["differences"] = diffs
+        differences.append(item)
     counts["total"] = len(rows)
     return {
         "batch_no": batch_no,
@@ -203,6 +230,8 @@ def _version_payload(conn, batch_id: int, batch_no: str, version: int) -> dict:
         "created_at": v["created_at"],
         "counts": counts,
         "differences": differences,
+        # 含 matched 行的全部逐行结论（matched 行带冻结累计退回额）
+        "lines": all_lines,
     }
 
 
@@ -392,13 +421,29 @@ def reverify(conn, batch_no: str) -> dict:
         old_rows = conn.execute(
             """
             SELECT receipt_id, status, holder_mismatch, amount_mismatch,
-                   payment_holder_code, payment_amount
+                   payment_holder_code, payment_amount, payment_refunded_total
             FROM receipt_verification_lines
             WHERE verification_id = %s
             """,
             (latest["id"],),
         ).fetchall()
-        old_map = {r["receipt_id"]: _conclusion_tuple(r) for r in old_rows}
+        old_map = {}
+        for r in old_rows:
+            # 未登记付款/重复回单行的累计退回额在库中为列默认值 0，
+            # 与新算结论的 None 归一化后再比较，避免凭空判定为结论变化。
+            old_refunded = (
+                int(r["payment_refunded_total"])
+                if r["payment_holder_code"] is not None
+                else None
+            )
+            old_map[r["receipt_id"]] = (
+                r["status"],
+                bool(r["holder_mismatch"]),
+                bool(r["amount_mismatch"]),
+                r["payment_holder_code"],
+                r["payment_amount"],
+                old_refunded,
+            )
         new_map = {l["receipt_id"]: _conclusion_tuple(l) for l in new_lines}
 
         if old_map == new_map:

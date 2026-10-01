@@ -202,6 +202,61 @@ CREATE TRIGGER payments_frozen_trg
     BEFORE UPDATE OR DELETE ON payments
     FOR EACH ROW EXECUTE FUNCTION payments_frozen();
 
+-- 银行退票：财务收到银行退回时，凭"原付款流水号 + 退回流水号 + 正整数分额"登记。
+-- refund_ref（退回流水号）全局唯一：同内容重试幂等返回原记录，异内容冲突拒绝；
+-- 原付款与单据保持不可变，退票只追加本记录（一经登记不可修改/删除）。
+-- 余额口径：单据正负累计 - 付款累计 + 退回累计（退回加回权利人余额，可为负）。
+CREATE TABLE IF NOT EXISTS payment_refunds (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payment_id   bigint NOT NULL REFERENCES payments(id),
+    refund_ref   text NOT NULL UNIQUE,
+    amount       bigint NOT NULL CHECK (amount > 0),
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+-- 按原付款汇总累计退回（超额校验主索引）；按权利人列退回流水走 payments 关联
+CREATE INDEX IF NOT EXISTS payment_refunds_payment_idx
+    ON payment_refunds(payment_id, id);
+
+-- 兜底约束：同一原付款的累计退回不得超过原付款金额（应用层在行锁下先行校验，
+-- 触发器为纵深防御；付款行锁使并发退回串行，正常路径不会触发）。
+CREATE OR REPLACE FUNCTION payment_refunds_within_payment() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    paid     bigint;
+    refunded bigint;
+BEGIN
+    SELECT amount INTO paid FROM payments WHERE id = NEW.payment_id;
+    SELECT COALESCE(SUM(amount), 0) INTO refunded
+    FROM payment_refunds
+    WHERE payment_id = NEW.payment_id AND id IS DISTINCT FROM NEW.id;
+    IF refunded + NEW.amount > paid THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'check_violation',
+            MESSAGE = 'cumulative refunds ' || (refunded + NEW.amount)
+                      || ' exceed original payment amount ' || paid;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_refunds_cap_trg ON payment_refunds;
+CREATE TRIGGER payment_refunds_cap_trg
+    BEFORE INSERT ON payment_refunds
+    FOR EACH ROW EXECUTE FUNCTION payment_refunds_within_payment();
+
+CREATE OR REPLACE FUNCTION payment_refunds_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'registered refunds are frozen and must not be ' || TG_OP
+                  || 'd; original payments and statements stay immutable';
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_refunds_frozen_trg ON payment_refunds;
+CREATE TRIGGER payment_refunds_frozen_trg
+    BEFORE UPDATE OR DELETE ON payment_refunds
+    FOR EACH ROW EXECUTE FUNCTION payment_refunds_frozen();
+
 -- 单据的可追溯性标记：traceable（本轮起出具、带逐笔证据）；
 -- legacy_untraceable（升级前已存在、只有汇总明细行、无法逐笔追溯的存量单据）
 ALTER TABLE statement_batches
@@ -282,9 +337,16 @@ CREATE TABLE IF NOT EXISTS receipt_verification_lines (
     amount_mismatch     boolean NOT NULL DEFAULT false,
     payment_holder_code text,
     payment_amount      bigint,
+    -- 冻结该版时，原付款的累计退回额（退票不改变匹配/不符判定；
+    -- 导入与复核时一并冻结，退回额变化即视为结论变化、产生新版本）
+    payment_refunded_total bigint NOT NULL DEFAULT 0,
     created_at          timestamptz NOT NULL DEFAULT now(),
     UNIQUE (verification_id, receipt_id)
 );
+
+-- 幂等迁移：已建库补"冻结累计退回额"列（历史版本保持 0，旧版结论不改写）
+ALTER TABLE receipt_verification_lines
+    ADD COLUMN IF NOT EXISTS payment_refunded_total bigint NOT NULL DEFAULT 0;
 
 -- 历史不可变：回单批次、原始回单、核验版本与逐行结论一经写入
 -- 即禁止修改/删除（核验只新增版本，绝不改写付款、余额或单据）。

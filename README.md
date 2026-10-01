@@ -27,7 +27,7 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
     其追补中无法归因的旧账差额单列为 `legacy`（无播放字段），**绝不用当前播放冒充历史**；
   - 并发出具不会重复生成证据；应付无变化不生成新单据，也不生成归因。
 - **按权利人付款核对（财务实付）**：
-  - 权利人当前余额 = **全部期间已出具单据明细的正负金额累计 − 已登记付款**；
+  - 权利人当前余额 = **全部期间已出具单据明细的正负金额累计 − 已登记付款 + 已登记银行退回**；
     试算（preview）不出具、待处理播放不入应付，**均不进余额**；
   - 登记付款须提供权利人编号、外部付款流水号与**正整数分额**，
     仅当金额 **不超过当时的正余额** 才入账，返回付款记录与登记后余额；
@@ -37,21 +37,37 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
     拒绝时**不留任何付款**；
   - 跨期更正产生负额追补后 **不撤销历史付款**：余额变负，留待后续正额抵扣，
     **余额不为正时禁止付款**；付款记录一经登记不可修改/删除（触发器强制）；
-  - 按权利人查询单据增减、付款流水与余额（`/rightsholders/{code}/ledger`）；
+  - 按权利人查询单据增减、付款流水、逐笔退回与余额（`/rightsholders/{code}/ledger`）；
   - 付款与出单/其他付款并发时，以「流水号事务咨询锁 + 权利人行锁（出单侧按编号升序加锁）」
     保证**校验与入账一致、绝不超付、无死锁**。
+- **银行退票（付款退回）登记（财务退票）**：
+  - 财务收到银行退票时，凭 **原付款流水号、退回流水号、正整数分额** 登记退回，
+    返回退回记录及登记后余额；**原付款和单据保持不可变**，退回只追加记录；
+  - 同一退回流水号 **同内容重试幂等返回原记录**（`status=duplicate`，HTTP 200），
+    **异内容**（原付款流水号或金额不同）返回 **409 `refund_ref_conflict`**；
+    原付款不存在 **404 `payment_not_found`**、金额非正整数 **422**、
+    累计退回超过原付款金额 **409 `refund_exceeds_payment`**，拒绝时**不留任何退回**；
+  - 权利人余额 = **已出具单据正负累计 − 付款累计 + 退回累计**（可为负）；
+    **后续付款仍只允许在正余额内登记**；退回记录一经登记不可修改/删除（触发器强制），
+    并有「累计退回不得超过原付款金额」触发器兜底；
+  - 并发协议：「退回流水号事务咨询锁 → **原付款行锁**（同付款多笔退回串行，
+    多个退回绝不合计超额）→ 权利人行锁（与付款/出单互斥）」，
+    退回、付款、出单并发时**余额校验一致、无死锁**；
+  - 对账单**保留付款总额**，另列 **退回总额、逐笔退回（携带原付款流水号）及余额**。
 - **银行回单批次导入与付款核验（财务对账）**：
   - 按批次导入回单：批次编号 + 回单行（回单编号、外部付款流水号、权利人编号、正整数分额）；
     批次同内容重试 **幂等返回原批次**（`status=duplicate`，HTTP 200）；
     批次号或回单编号 **异内容复用**、批内重复流水号、无效字段均 **整批拒绝**，
     不留任何回单；
   - 跨批次同一付款流水号 **仅首次成功导入的回单参与核验**，其余标为 **重复回单**；
-  - 有效回单按流水号对照已登记付款，区分 **匹配 / 付款未登记 / 权利人不符 / 金额不符**，
-    两项均不符 **同时列出**；导入时 **冻结逐行结论**（第 1 版）；
-  - 付款迟到后可 **复核**：结论变化才生成 **新版本**，结论不变不新增版本；
-    **旧版本与原始回单始终可查**；
-  - 每版输出 **状态计数及差异行**；付款与复核并发时，一版内全部结论来自
-    **同一已提交状态**（单语句快照）；核验 **不改写付款、余额或单据**。
+  - 有效回单 **仍按原付款字段**（流水号、权利人、金额）对照已登记付款，区分
+    **匹配 / 付款未登记 / 权利人不符 / 金额不符**，两项均不符 **同时列出**
+    （退票不改变匹配/不符判定）；导入时 **冻结逐行结论与该付款累计退回额**（第 1 版）；
+  - 付款迟到或银行退票后可 **复核**：**原核验结论或冻结退回额变化**才生成 **新版本**，
+    都不变不新增版本；**旧版本结论与冻结值不改写、始终可查**；
+  - 每版输出 **状态计数、全部逐行冻结结论（含匹配行的累计退回额）及差异行**；
+    付款/退回与复核并发时，一版内全部结论来自 **同一已提交状态**（单语句快照）；
+    核验 **不改写付款、退回、余额或单据**。
 
 ## 一键启动
 
@@ -147,12 +163,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/statements?start=&end=` | 列出该期间全部单据及明细（含 `traceable` 可追溯标记） |
 | GET | `/statements/{batch_id}/attributions` | 按单据分页查询逐笔归因记录与逐权利人合计（可按 `holder_code` 过滤） |
 
-### 付款核对
+### 付款核对与银行退票
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/payments` | 登记已完成付款；新登记 201，同流水号同内容重试 200 返回原记录 |
-| GET | `/rightsholders/{holder_code}/ledger` | 按权利人查询单据增减、付款流水及当前余额（不存在 404） |
+| POST | `/refunds` | 登记银行退票（原付款流水号 + 退回流水号 + 正整数分额）；新登记 201，同退回流水号同内容重试 200 |
+| GET | `/rightsholders/{holder_code}/ledger` | 按权利人查询单据增减、付款流水、逐笔退回及当前余额（不存在 404） |
 
 ### 银行回单核验
 
@@ -195,10 +212,57 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `GET /rightsholders/{holder_code}/ledger` 响应要点：
 
 - `billed_total`：该权利人全部期间已出具单据明细（初次单与正负追补单）有符号累计；
-- `paid_total`：已登记付款累计；`balance = billed_total − paid_total`（可为负）；
+- `paid_total`：已登记付款累计（**保留付款总额，不因退票而冲减**）；
+  `refunded_total`：已登记银行退回累计；
+  `balance = billed_total − paid_total + refunded_total`（可为负）；
 - `statements[]`：每张涉及该权利人的单据（`batch_id`、`kind`、期间、`amount` 带正负号、`issued_at`），
   按出具次序；`payments[]`：付款流水（`payment_id`、`external_ref`、`amount`、`registered_at`）；
+- `refunds[]`：**逐笔银行退回**（`refund_id`、`refund_ref`、`payment_id`、
+  `payment_ref` 原付款流水号、`amount`、`registered_at`），按登记次序；
 - 试算与待处理播放不在内；负余额表示"历史付款暂未被后续正额抵扣完"，仍可核对。
+
+### 银行退票登记
+
+`POST /refunds` 请求体：
+
+```json
+{
+  "payment_ref": "BANK-20260301-0001",
+  "refund_ref": "BANK-RET-20260305-0001",
+  "amount": 4
+}
+```
+
+- `payment_ref` 为**原付款流水号**（必须指向一笔已登记付款）；
+  `refund_ref` 为**退回流水号**（调用方提供，全局唯一）；
+  `amount` 为正整数、最小货币单位（分）。
+- 成功响应（201，`status=created`，含退回记录与登记后余额）：
+
+```json
+{
+  "refund_id": 1,
+  "payment_id": 1,
+  "payment_ref": "BANK-20260301-0001",
+  "refund_ref": "BANK-RET-20260305-0001",
+  "amount": 4,
+  "registered_at": "2026-03-05T10:00:00Z",
+  "status": "created",
+  "balance_after": 4
+}
+```
+
+- 幂等重试时 `status="duplicate"`、HTTP 200，`refund_id` 与原记录相同，
+  `balance_after` 为**当前**余额；不产生第二笔退回，**原付款与单据不变**。
+- 错误：原付款不存在 → 404 `payment_not_found`；同退回流水号异内容 →
+  409 `refund_ref_conflict`（`detail` 回显原原付款流水号/金额）；
+  累计退回（含本笔）超过原付款金额 → 409 `refund_exceeds_payment`
+  （`detail` 含 `payment_amount`、`already_refunded`、`requested_amount`）；
+  金额为 0、负数或非整数 → 422。上述拒绝均**不写入**任何退回。
+- 余额口径随之变为 **单据累计 − 付款累计 + 退回累计**（可为负）；
+  退回加回的余额可供后续付款，但**付款仍只允许在当时的正余额内登记**。
+- 并发保证：同一退回流水号的并发请求串行（恰一笔登记，其余幂等）；
+  同一原付款的多笔并发退回经**原付款行锁**串行，合计绝不超过原付款金额；
+  退回与付款/出单经**权利人行锁**互斥，余额校验所见即所入账，加锁次序统一、无死锁。
 
 期间同样是半开区间 `[start, end)`，与协议区间语义一致。
 
@@ -220,7 +284,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   `holder_code`（权利人编号，回单所载，不要求已建档）、`amount`（正整数分额）；
   空编号、非正整数金额等无效字段 **422 整批拒绝**，不留任何回单。
 - 导入响应（201，`status=created`）含原始回单行（`is_duplicate` 标记）与
-  导入时冻结的第 1 版核验结论 `verification`：
+  导入时冻结的第 1 版核验结论 `verification`。每版除 `differences[]`（差异行）外
+  另含 `lines[]`（**全部回单行的冻结结论，含 matched 行**），每行带
+  `payment_refunded_total`（核验时冻结的**原付款累计退回额**；
+  付款未登记/重复回单时为 `null`）：
 
 ```json
 {
@@ -241,7 +308,20 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
       {"receipt_no": "RC-2", "external_ref": "BANK-20260302-0002",
        "status": "mismatched", "differences": ["holder_mismatch"],
        "receipt_holder_code": "RS-B", "receipt_amount": 9,
-       "payment_holder_code": "RS-C", "payment_amount": 9}
+       "payment_holder_code": "RS-C", "payment_amount": 9,
+       "payment_refunded_total": 0}
+    ],
+    "lines": [
+      {"receipt_no": "RC-1", "external_ref": "BANK-20260301-0001",
+       "status": "matched", "differences": [],
+       "receipt_holder_code": "RS-A", "receipt_amount": 19,
+       "payment_holder_code": "RS-A", "payment_amount": 19,
+       "payment_refunded_total": 0},
+      {"receipt_no": "RC-2", "external_ref": "BANK-20260302-0002",
+       "status": "mismatched", "differences": ["holder_mismatch"],
+       "receipt_holder_code": "RS-B", "receipt_amount": 9,
+       "payment_holder_code": "RS-C", "payment_amount": 9,
+       "payment_refunded_total": 0}
     ]
   }
 }
@@ -252,6 +332,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   `holder_mismatch` / `amount_mismatch`，**两项均不符同时列出**）、
   `duplicate`（跨批次同一流水号的重复回单，不参与核验）；
   差异行附回单与付款双方快照（`receipt_*` / `payment_*`）。
+- **退票联动**：有效回单**仍按原付款字段**判定匹配/不符，银行退回不改变结论；
+  导入与复核时另冻结该付款当时的 **累计退回额** `payment_refunded_total`，
+  因此付款即使已全额退回，回单结论仍可为 `matched`。
 - 幂等与拒绝：批次同内容重试 **200 返回原批次**（`status=duplicate`，含第 1 版结论）；
   批次号异内容复用 **409 `receipt_batch_conflict`**；
   回单编号异内容复用 **409 `receipt_no_conflict`**（`detail` 回显已导入内容）；
@@ -259,13 +342,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 跨批次同一流水号：仅 **首次成功导入** 的回单参与核验；后续批次中同号回单
   标为 `is_duplicate=true`、结论 `duplicate`（同内容复用回单编号亦按此处理）。
 
-`POST /receipts/{batch_no}/reverify`（付款迟到后复核）：
+`POST /receipts/{batch_no}/reverify`（付款迟到或银行退票后复核）：
 
-- 按 **当前已登记付款** 重算逐行结论：与最新版不同才冻结为新版本
-  （201，`status=created`）；结论不变不新增版本
+- 按 **当前已登记付款与当前累计退回额** 重算逐行结论：**原核验结论（状态/不符项/
+  付款快照）或冻结的累计退回额任一变化**才冻结为新版本
+  （201，`status=created`）；都不变不新增版本
   （200，`status=unchanged`，返回现有最新版）；
-- 付款与复核并发时，一版内全部结论来自 **同一已提交状态**（单语句快照）；
-- 复核只新增核验版本，**绝不改写付款、余额或单据**；批次不存在 404。
+- 付款/退回与复核并发时，一版内全部结论来自 **同一已提交状态**（单语句快照）；
+- 复核只新增核验版本，**绝不改写付款、退回、余额或单据**，旧版本冻结值不改写；
+  批次不存在 404。
 
 查询（旧版本与原始回单始终可查）：
 
@@ -442,6 +527,42 @@ curl -sS -X POST http://localhost:8000/receipts/import -H 'Content-Type: applica
 # => RC-4 is_duplicate=true，结论 status=duplicate
 ```
 
+财务收到银行退票时，凭原付款流水号登记退回（承上：RS-B 的 BANK-20260302-0002 已付 9 分）：
+
+```bash
+# 1) 部分退回 4 分：原付款/单据不变，余额加回 4 => 201，balance_after=4
+curl -sS -X POST http://localhost:8000/refunds -H 'Content-Type: application/json' \
+  -d '{"payment_ref":"BANK-20260302-0002",
+       "refund_ref":"BANK-RET-20260305-0001","amount":4}' | python3 -m json.tool
+
+# 2) 同退回流水号同内容重试 => 200 status=duplicate 返回原记录，不重复入账
+curl -sS -X POST http://localhost:8000/refunds -H 'Content-Type: application/json' \
+  -d '{"payment_ref":"BANK-20260302-0002",
+       "refund_ref":"BANK-RET-20260305-0001","amount":4}'
+
+# 3) 异内容冲突 / 原付款不存在 / 金额非正整数
+curl -sS -i -X POST http://localhost:8000/refunds -H 'Content-Type: application/json' \
+  -d '{"payment_ref":"BANK-20260302-0002",
+       "refund_ref":"BANK-RET-20260305-0001","amount":3}' | head -1   # 409 refund_ref_conflict
+curl -sS -i -X POST http://localhost:8000/refunds -H 'Content-Type: application/json' \
+  -d '{"payment_ref":"BANK-NOT-EXIST","refund_ref":"X","amount":1}' | head -1  # 404 payment_not_found
+curl -sS -i -X POST http://localhost:8000/refunds -H 'Content-Type: application/json' \
+  -d '{"payment_ref":"BANK-20260302-0002","refund_ref":"X","amount":0}' | head -1  # 422
+
+# 4) 累计退回超过原付款金额 => 409 refund_exceeds_payment，不留记录
+#    （已退 4，再退 6 => 累计 10 > 9）
+curl -sS -i -X POST http://localhost:8000/refunds -H 'Content-Type: application/json' \
+  -d '{"payment_ref":"BANK-20260302-0002",
+       "refund_ref":"BANK-RET-20260305-0002","amount":6}' | head -1
+
+# 5) 对账单：保留付款总额，另列退回总额、逐笔退回与余额（billed-paid+refunded）
+curl -sS http://localhost:8000/rightsholders/RS-B/ledger | python3 -m json.tool
+
+# 6) 复核回单批次：有效回单仍按原付款字段判定，冻结的累计退回额变化也产生新版本
+curl -sS -X POST http://localhost:8000/receipts/RC-20260301-01/reverify \
+  | python3 -m json.tool
+```
+
 ## 分摊示例
 
 金额 100，比例 62.5% / 30% / 7.5%：
@@ -466,14 +587,18 @@ python3 -m unittest discover -s tests -v
 逐笔归因证据（冻结/撤销负额/分页对账/不可变/存量不可追溯与 legacy 旧账/错误码）另有一套；
 付款核对（余额口径/幂等与冲突/超额拒绝不留痕/负额追补不撤销与后续抵扣/
 试算待处理不入账/付款与出单及其他付款并发不超付）再有一套；
-银行回单核验（整批拒绝/幂等重试/异内容复用/跨批次重复回单/冻结结论/迟到付款复核版本化/
-并发复核与并发导入/付款与复核并发快照一致/核验不改写账务）又有一套：
+银行退票（登记与退回后余额/原付款单据不可变/幂等与冲突/累计超额拒绝不留痕/
+同付款多笔并发退回不合计超额/退回与付款及出单并发余额一致无死锁/
+对账单付款与退回总额分列）与回单核验（整批拒绝/幂等重试/异内容复用/跨批次重复回单/
+冻结结论与累计退回额/迟到付款及退回复核版本化/并发复核与并发导入/
+付款退回与复核并发快照一致/核验不改写账务）各有一套：
 
 ```bash
 pip install pgserver httpx
 PYTHONPATH=. python3 tests/integration_pgserver.py       # 原有全链路
 PYTHONPATH=. python3 tests/integration_attribution.py    # 逐笔归因证据
 PYTHONPATH=. python3 tests/integration_payments.py       # 付款登记与权利人对账
+PYTHONPATH=. python3 tests/integration_refunds.py        # 银行退票登记与回单退回额冻结
 PYTHONPATH=. python3 tests/integration_receipts.py       # 银行回单批次导入与付款核验
 ```
 
@@ -488,14 +613,16 @@ app/
   schemas.py              # Pydantic 模型与输入校验
   statements_service.py   # 期间匹配、重算、初次/追补出具、并发互斥、逐笔归因冻结与分页对账
   payments_service.py     # 付款登记（流水号锁/余额校验/幂等冲突）、权利人对账单、出单侧权利人行锁
-  receipts_service.py     # 回单批次导入（幂等/整批拒绝/跨批次去重）、核验结论冻结与复核版本化
+  refunds_service.py      # 银行退票登记（退回流水号锁 + 原付款行锁 + 权利人行锁，累计超额拒绝/幂等冲突）
+  receipts_service.py     # 回单批次导入（幂等/整批拒绝/跨批次去重）、核验结论与累计退回额冻结、复核版本化
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
     statements.py         # 单据出具、试算、查询、逐笔归因分页查询
     payments.py           # 付款登记、按权利人对账
+    refunds.py            # 银行退票登记
     receipts.py           # 回单批次导入、复核、版本查询
-examples/demo.sh          # 端到端 curl 示例
-tests/                    # 单元测试与四套 pgserver 端到端集成测试
+examples/demo.sh          # 端到端 curl 示例（含银行退票登记与退回后复核）
+tests/                    # 单元测试与五套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```

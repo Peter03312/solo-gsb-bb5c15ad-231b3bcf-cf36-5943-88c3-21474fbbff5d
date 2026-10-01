@@ -41,12 +41,13 @@ def register_payment(body: PaymentIn, conn=Depends(get_conn)):
 
 @router.get("/rightsholders/{holder_code}/ledger", response_model=HolderLedger)
 def get_holder_ledger(holder_code: str, conn=Depends(get_conn)):
-    """按权利人核对：单据增减、付款流水与当前余额。
+    """按权利人核对：单据增减、付款流水、逐笔退回与当前余额。
 
     - statements[] 为该权利人全部期间已出具单据的明细行（追补差额保留正负号），
       按单据出具次序排列；payments[] 为已登记付款流水；
-    - billed_total=单据正负累计、paid_total=付款累计、
-      balance=billed_total-paid_total（可为负，即待后续正额抵扣）；
+      refunds[] 为逐笔银行退回（携带原付款流水号）；
+    - billed_total=单据正负累计、paid_total=付款累计、refunded_total=退回累计、
+      balance=billed_total-paid_total+refunded_total（可为负，即待后续正额抵扣）；
     - 待处理播放与试算不在内；权利人不存在返回 404 holder_not_found。
     """
     result = svc.get_holder_ledger(conn, holder_code)

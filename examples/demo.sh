@@ -208,4 +208,62 @@ $C -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' -d '{
   ]
 }' | python3 -m json.tool
 
+say "31) 银行退票：凭原付款流水号 + 退回流水号 + 正整数分额登记（原付款/单据不变）"
+# RS-B 已付 9 分（BANK-20260302-0002），银行先退回 4 分 => 余额加回为 4
+$C -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "payment_ref":"BANK-20260302-0002",
+  "refund_ref":"BANK-RET-20260305-0001",
+  "amount":4
+}' | python3 -m json.tool
+
+say "32) 同退回流水号同内容重试 => 幂等原记录(status=duplicate, HTTP 200)；异内容 => 409"
+$C -i -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "payment_ref":"BANK-20260302-0002",
+  "refund_ref":"BANK-RET-20260305-0001",
+  "amount":4
+}' | head -1
+# 金额不同 => 409 refund_ref_conflict（回显原原付款流水号/金额）
+$C -i -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "payment_ref":"BANK-20260302-0002",
+  "refund_ref":"BANK-RET-20260305-0001",
+  "amount":3
+}' | head -1
+
+say "33) 原付款不存在 404；金额非正整数 422；累计退回超过原付款 409 且不留记录"
+$C -i -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "payment_ref":"BANK-NOT-EXIST","refund_ref":"X","amount":1}' | head -1
+$C -i -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "payment_ref":"BANK-20260302-0002","refund_ref":"X","amount":0}' | head -1
+# 已退 4，再退 6 => 累计 10 > 原付款 9 => 409 refund_exceeds_payment
+$C -i -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "payment_ref":"BANK-20260302-0002",
+  "refund_ref":"BANK-RET-20260305-0002",
+  "amount":6
+}' | head -1
+
+say "34) 再退 5 分恰好退清（累计 9 = 原付款 9），余额加回至 9"
+$C -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "payment_ref":"BANK-20260302-0002",
+  "refund_ref":"BANK-RET-20260305-0003",
+  "amount":5
+}' | python3 -m json.tool
+
+say "35) 对账单：保留付款总额，另列退回总额 refunded_total、逐笔退回 refunds[] 与余额"
+$C "$BASE/rightsholders/RS-B/ledger" | python3 -m json.tool
+
+say "36) 退回加回的余额可供后续付款（仍只允许在正余额内登记，超额拒绝）"
+$C -X POST "$BASE/payments" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","external_ref":"BANK-20260310-0010","amount":8}' \
+  | python3 -m json.tool
+$C -i -X POST "$BASE/payments" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","external_ref":"BANK-20260310-0011","amount":2}' | head -1
+
+say "37) 回单核验联动：匹配仍按原付款字段；复核另冻结累计退回额，退回额变化才出新版本"
+# RC-20260301-01 的 R2 对 BANK-20260302-0002（RS-B 9 分）原判权利人不符；
+# 该付款现已累计退回 9 分。复核 => 结论不变但冻结退回额 0->9，生成新版本；
+# 再复核 => status=unchanged，不新增版本；旧版冻结值不改写。
+$C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
+$C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
+$C "$BASE/receipts/RC-20260301-01/versions/1" | python3 -m json.tool
+
 say "完成"

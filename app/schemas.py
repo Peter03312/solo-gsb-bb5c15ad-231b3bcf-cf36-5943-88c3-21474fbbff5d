@@ -292,6 +292,18 @@ class LedgerPaymentItem(BaseModel):
     registered_at: datetime
 
 
+# 银行退回条目（凭原付款流水号登记，逐笔退回加回余额）
+class LedgerRefundItem(BaseModel):
+    refund_id: int
+    # 退回流水号
+    refund_ref: str
+    # 原付款记录编号与原付款流水号
+    payment_id: int
+    payment_ref: str
+    amount: int
+    registered_at: datetime
+
+
 class HolderLedger(BaseModel):
     holder_code: str
     name: str | None
@@ -299,10 +311,47 @@ class HolderLedger(BaseModel):
     billed_total: int
     # 已登记付款累计
     paid_total: int
-    # 当前余额 = billed_total - paid_total（可为负：跨期负额追补后留待后续抵扣）
+    # 已登记银行退回累计
+    refunded_total: int
+    # 当前余额 = billed_total - paid_total + refunded_total
+    # （可为负：跨期负额追补后留待后续抵扣；退回只加回余额，不改变可负性）
     balance: int
     statements: list[LedgerStatementItem]
     payments: list[LedgerPaymentItem]
+    # 逐笔银行退回（原付款与单据不可变，退回只追加）
+    refunds: list[LedgerRefundItem]
+
+
+# ---- 银行退票（付款退回）登记 ----
+
+class RefundIn(BaseModel):
+    # 原付款流水号（必须指向一笔已登记付款；不存在 404 payment_not_found）
+    payment_ref: str = Field(min_length=1, max_length=200)
+    # 退回流水号（调用方提供，全局唯一；同内容重试幂等、异内容 409）
+    refund_ref: str = Field(min_length=1, max_length=200)
+    # 正整数分额（最小货币单位）；累计退回超过原付款金额 409
+    amount: int = Field(strict=True, ge=1)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def reject_bool_amount(cls, v):
+        # JSON 的 true/false 虽是 int 子类，但不是合法金额
+        if isinstance(v, bool):
+            raise ValueError("amount must be an integer, not boolean")
+        return v
+
+
+class RefundOut(BaseModel):
+    refund_id: int
+    payment_id: int
+    payment_ref: str
+    refund_ref: str
+    amount: int
+    registered_at: datetime
+    # created=新登记；duplicate=同退回流水号同内容重试，返回原记录
+    status: str
+    # 登记后余额（重试时为当前余额）
+    balance_after: int
 
 
 # ---- 银行回单批次导入与付款核验 ----
@@ -353,6 +402,15 @@ class ReceiptDifferenceOut(BaseModel):
     # 核验时冻结的已登记付款快照；付款未登记/重复回单为 None
     payment_holder_code: str | None
     payment_amount: int | None
+    # 核验时冻结的"原付款累计退回额"；付款未登记/重复回单为 None。
+    # 退票不改变按原付款字段判定的匹配/不符结论；该额仅随核验版本冻结。
+    payment_refunded_total: int | None = None
+
+
+class ReceiptVerificationLineOut(ReceiptDifferenceOut):
+    # 匹配行（status=matched）的不符项恒为空；其余同差异行字段，
+    # payment_refunded_total 为该版冻结时原付款的累计退回额。
+    pass
 
 
 class ReceiptVerificationOut(BaseModel):
@@ -363,6 +421,9 @@ class ReceiptVerificationOut(BaseModel):
     counts: dict[str, int]
     # 差异行：全部非 matched 行（含重复回单），按回单编号升序
     differences: list[ReceiptDifferenceOut]
+    # 全部回单行的冻结结论（含 matched 行），按回单编号升序；
+    # 每行带该版冻结时原付款的累计退回额 payment_refunded_total
+    lines: list[ReceiptVerificationLineOut] = []
 
 
 class ReceiptBatchOut(BaseModel):

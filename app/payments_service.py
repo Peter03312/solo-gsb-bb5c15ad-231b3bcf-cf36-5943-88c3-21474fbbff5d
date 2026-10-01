@@ -1,16 +1,18 @@
-"""付款登记与权利人对账。
+"""付款登记、银行退回与权利人对账。
 
 余额口径：全部期间已出具单据明细行（初次单与正负追补单）金额的代数和，
-减去全部已登记付款。试算（preview）不出具、待处理播放不计入应付，
-因此二者天然不进入余额。
+减去全部已登记付款，再加上全部已登记银行退回。试算（preview）不出具、
+待处理播放不计入应付，因此二者天然不进入余额。
 
-并发协议（与出单互斥，杜绝超付）：
+并发协议（与出单互斥，杜绝超付/超退）：
 - 登记付款先取"外部流水号事务咨询锁"（序列化同一流水号的并发重试），
   再对该权利人行取行锁；余额校验与付款插入在同一事务内原子完成。
+- 登记银行退回先取"退回流水号事务咨询锁"，再锁定原付款行
+  （同一原付款的多笔并发退回在此串行，累计退回绝不合计超额），
+  随后锁定权利人行（与付款/出单的余额校验互斥）。
 - 出单（statements_service）在写任何明细行前，按权利人编号排序锁定
-  本次受影响的全部权利人行。两边都持有行锁才写账，
-  故"付款与出单/其他付款"并发时校验所见即所入账，不会超付；
-  出单侧统一按编号升序取锁，无死锁。
+  本次受影响的全部权利人行。加锁次序统一为"付款/退回流水号咨询锁 →
+  付款行（仅退回）→ 按编号升序的权利人行"，无死锁。
 """
 import hashlib
 
@@ -43,6 +45,14 @@ FROM payments
 WHERE holder_code = %s
 """
 
+# 银行退回累计：payment_refunds 经 payment_id 关联付款，退回加回余额。
+_REFUNDED_TOTAL_SQL = """
+SELECT COALESCE(SUM(r.amount), 0) AS refunded
+FROM payment_refunds r
+JOIN payments p ON p.id = r.payment_id
+WHERE p.holder_code = %s
+"""
+
 
 def _billed_total(conn, holder_code: str) -> int:
     return int(conn.execute(_BILLED_TOTAL_SQL, (holder_code,)).fetchone()["billed"])
@@ -52,9 +62,19 @@ def _paid_total(conn, holder_code: str) -> int:
     return int(conn.execute(_PAID_TOTAL_SQL, (holder_code,)).fetchone()["paid"])
 
 
+def _refunded_total(conn, holder_code: str) -> int:
+    return int(
+        conn.execute(_REFUNDED_TOTAL_SQL, (holder_code,)).fetchone()["refunded"]
+    )
+
+
 def get_balance(conn, holder_code: str) -> int:
-    """当前余额 = 已出具单据累计 - 已登记付款（可为负）。"""
-    return _billed_total(conn, holder_code) - _paid_total(conn, holder_code)
+    """当前余额 = 已出具单据累计 - 已登记付款 + 已退回累计（可为负）。"""
+    return (
+        _billed_total(conn, holder_code)
+        - _paid_total(conn, holder_code)
+        + _refunded_total(conn, holder_code)
+    )
 
 
 def lock_holders_for_billing(conn, holder_codes) -> None:
@@ -211,15 +231,29 @@ def get_holder_ledger(conn, holder_code: str):
         (holder_code,),
     ).fetchall()
 
+    refund_rows = conn.execute(
+        """
+        SELECT r.id AS refund_id, r.refund_ref, r.amount, r.created_at,
+               r.payment_id, p.external_ref AS payment_ref
+        FROM payment_refunds r
+        JOIN payments p ON p.id = r.payment_id
+        WHERE p.holder_code = %s
+        ORDER BY r.id
+        """,
+        (holder_code,),
+    ).fetchall()
+
     billed_total = sum(int(r["amount"]) for r in statement_rows)
     paid_total = sum(int(r["amount"]) for r in payment_rows)
+    refunded_total = sum(int(r["amount"]) for r in refund_rows)
 
     return {
         "holder_code": holder["code"],
         "name": holder["name"],
         "billed_total": billed_total,
         "paid_total": paid_total,
-        "balance": billed_total - paid_total,
+        "refunded_total": refunded_total,
+        "balance": billed_total - paid_total + refunded_total,
         "statements": [
             {
                 "batch_id": r["batch_id"],
@@ -239,5 +273,16 @@ def get_holder_ledger(conn, holder_code: str):
                 "registered_at": r["created_at"],
             }
             for r in payment_rows
+        ],
+        "refunds": [
+            {
+                "refund_id": r["refund_id"],
+                "refund_ref": r["refund_ref"],
+                "payment_id": r["payment_id"],
+                "payment_ref": r["payment_ref"],
+                "amount": int(r["amount"]),
+                "registered_at": r["created_at"],
+            }
+            for r in refund_rows
         ],
     }
